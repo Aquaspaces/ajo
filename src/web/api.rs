@@ -1,5 +1,5 @@
-//! Defines Rojo's HTTP API, all under /api. These endpoints generally return
-//! JSON.
+//! Defines Rojo's HTTP API, all under /api. Sync endpoints return MessagePack;
+//! the opt-in Studio control endpoints return JSON.
 
 use std::{collections::HashMap, fs, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
@@ -35,6 +35,10 @@ pub async fn call(
     mut request: Request<Body>,
 ) -> Response<Body> {
     let service = ApiService::new(serve_session, remote_addr);
+
+    if request.uri().path().starts_with("/api/studio/") {
+        return super::studio::call(Arc::clone(&service.serve_session), remote_addr, request).await;
+    }
 
     match (request.method(), request.uri().path()) {
         (&Method::GET, "/api/rojo") => service.handle_api_rojo().await,
@@ -96,6 +100,7 @@ impl ApiService {
             place_id: self.serve_session.place_id(),
             game_id: self.serve_session.game_id(),
             root_instance_id,
+            studio_controls: self.serve_session.studio_bridge().enabled(),
         })
     }
 
@@ -113,7 +118,12 @@ impl ApiService {
         };
 
         // Upgrade the connection to WebSocket
-        let (response, websocket) = match upgrade(request, None) {
+        let config = hyper_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_message_size: Some(super::studio::MAX_PACKET_BYTES),
+            max_frame_size: Some(super::studio::MAX_PACKET_BYTES),
+            ..Default::default()
+        };
+        let (response, websocket) = match upgrade(request, Some(config)) {
             Ok(result) => result,
             Err(err) => {
                 return msgpack(
@@ -505,12 +515,14 @@ async fn handle_websocket_subscription(
     // Now continuously listen for new messages using select to handle both incoming messages
     // and WebSocket control messages concurrently
     let mut cursor = input_cursor;
+    let mut receiver = message_queue.subscribe(cursor);
+    let mut studio_connection = None;
+    let mut studio_commands: Option<tokio::sync::mpsc::Receiver<crate::studio::StudioCommand>> =
+        None;
     loop {
-        let receiver = message_queue.subscribe(cursor);
-
         tokio::select! {
             // Handle new messages from the message queue
-            result = receiver => {
+            result = &mut receiver => {
                 match result {
                     Ok((new_cursor, messages)) => {
                         if !messages.is_empty() {
@@ -542,6 +554,7 @@ async fn handle_websocket_subscription(
                             }
                             cursor = new_cursor;
                         }
+                        receiver = message_queue.subscribe(cursor);
                     }
                     Err(_) => {
                         // Message queue disconnected
@@ -549,6 +562,19 @@ async fn handle_websocket_subscription(
                         let _ = websocket.send(Message::Close(None)).await;
                         break;
                     }
+                }
+            }
+
+            command = async {
+                match studio_commands.as_mut() {
+                    Some(commands) => commands.recv().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                let Some(command) = command else { break; };
+                if studio_connection.as_ref().is_some_and(|connection: &crate::studio::StudioConnection| connection.is_pending(&command.request_id)) {
+                    let packet = serde_json::json!({"sessionId":session_id,"packetType":"studioCommand","body":command});
+                    if websocket.send(Message::Text(serde_json::to_string(&packet)?)).await.is_err() { break; }
                 }
             }
 
@@ -566,11 +592,14 @@ async fn handle_websocket_subscription(
                     Some(Ok(Message::Pong(data))) => {
                         log::debug!("Received pong: {:?}", data);
                     }
-                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                        // Ignore text/binary messages from client for subscription endpoint
-                        // TODO: Use this for bidirectional sync or requesting fallbacks?
-                        log::debug!("Ignoring message from client since we don't use it for anything yet: {:?}", msg);
+                    Some(Ok(Message::Text(text))) if serve_session.studio_bridge().enabled() => {
+                        if let Err(err) = super::studio::handle_packet(&serve_session, &text, &mut studio_connection, &mut studio_commands) {
+                            log::warn!("Invalid Studio control packet: {err}");
+                            let _ = websocket.send(Message::Close(None)).await;
+                            break;
+                        }
                     }
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {}
                     Some(Ok(Message::Frame(_))) => {
                         // This should never happen according to tungstenite docs
                         unreachable!();

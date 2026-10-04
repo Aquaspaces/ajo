@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added `rojo mcp` for agent access to served projects and opt-in Studio status and selection controls, enabled with `rojo serve --enable-studio-controls`.
+
 ## [7.7.1] (October 1st, 2026)
 
 * Fixed `$path` values that point outside the project folder failing to match `syncRule`s on Windows, which broke `rojo sourcemap` with a "could not be turned into a Roblox Instance" error. ([#1290])

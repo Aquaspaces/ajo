@@ -4,6 +4,7 @@ mod build;
 mod doc;
 mod fmt_project;
 mod init;
+mod mcp;
 mod plugin;
 mod serve;
 mod sourcemap;
@@ -20,6 +21,7 @@ pub use self::build::BuildCommand;
 pub use self::doc::DocCommand;
 pub use self::fmt_project::FmtProjectCommand;
 pub use self::init::{InitCommand, InitKind};
+pub use self::mcp::McpCommand;
 pub use self::plugin::{PluginCommand, PluginSubcommand};
 pub use self::serve::ServeCommand;
 pub use self::sourcemap::SourcemapCommand;
@@ -42,6 +44,7 @@ impl Options {
     pub fn run(self) -> anyhow::Result<()> {
         match self.subcommand {
             Subcommand::Init(subcommand) => subcommand.run(),
+            Subcommand::Mcp(subcommand) => subcommand.run(),
             Subcommand::Serve(subcommand) => subcommand.run(self.global),
             Subcommand::Build(subcommand) => subcommand.run(),
             Subcommand::Upload(subcommand) => subcommand.run(),
@@ -116,6 +119,7 @@ pub struct ColorChoiceParseError {
 #[derive(Debug, Parser)]
 pub enum Subcommand {
     Init(InitCommand),
+    Mcp(McpCommand),
     Serve(ServeCommand),
     Build(BuildCommand),
     Upload(UploadCommand),

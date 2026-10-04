@@ -6,8 +6,9 @@ mod api;
 mod assets;
 pub mod interface;
 mod origin;
+mod studio;
 mod ui;
-mod util;
+pub(crate) mod util;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

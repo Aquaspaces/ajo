@@ -18,6 +18,7 @@ local PatchSet = require(script.Parent.PatchSet)
 local Reconciler = require(script.Parent.Reconciler)
 local strict = require(script.Parent.strict)
 local Settings = require(script.Parent.Settings)
+local StudioControls = require(script.Parent.StudioControls)
 local orderSwaps = require(script.Parent.orderSwaps)
 
 local Status = strict("Session.Status", {
@@ -83,6 +84,11 @@ function ServeSession.new(options)
 	end
 
 	local instanceMap = InstanceMap.new(onInstanceChanged)
+	local studioControls = StudioControls.new(instanceMap, {
+		game = game,
+		runService = RunService,
+		selection = Selection,
+	})
 	local changeBatcher = ChangeBatcher.new(instanceMap, onChangesFlushed)
 	local reconciler = Reconciler.new(instanceMap)
 
@@ -103,6 +109,7 @@ function ServeSession.new(options)
 		__twoWaySync = options.twoWaySync,
 		__reconciler = reconciler,
 		__instanceMap = instanceMap,
+		__studioControls = studioControls,
 		__changeBatcher = changeBatcher,
 		__statusChangedCallback = nil,
 		__connections = connections,
@@ -210,12 +217,41 @@ function ServeSession:start()
 
 						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
 
-						for _, message in messagesPacket.messages do
-							self:__applyPatch(message)
+						self.__studioControls:beginSync()
+						local success, err = pcall(function()
+							for _, message in messagesPacket.messages do
+								self:__applyPatch(message)
+							end
+							self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+						end)
+						self.__studioControls:endSync()
+						if not success then
+							error(err, 0)
 						end
-						self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
 					end,
-				})
+					["studioCommand"] = function(commandPacket)
+						if self.__status ~= Status.Connected then
+							return
+						end
+
+						local success, result = pcall(function()
+							return self.__studioControls:execute(commandPacket.command, commandPacket.ids)
+						end)
+						local response = { requestId = commandPacket.requestId }
+						if success then
+							response.result = result
+						else
+							response.error = tostring(result)
+						end
+						self.__apiContext:sendStudioResult(response)
+					end,
+				}, function()
+					return {
+						placeId = game.PlaceId,
+						gameId = game.GameId,
+						placeName = game.Name,
+					}
+				end)
 			end)
 		end)
 		:catch(function(err)

@@ -165,6 +165,8 @@ pub struct ServerInfoResponse {
     pub game_id: Option<u64>,
     pub place_id: Option<u64>,
     pub root_instance_id: Ref,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_controls: bool,
 }
 
 /// Response body from /api/read/{id}
