@@ -39,6 +39,11 @@ pub struct ServeCommand {
     /// validation for binds where it is otherwise off (such as `0.0.0.0`).
     #[clap(long, value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
+
+    /// Allow local agents to inspect connected Studios and change their selection.
+    /// Requires a loopback bind address and a plugin supporting Studio controls.
+    #[clap(long)]
+    pub enable_studio_controls: bool,
 }
 
 impl ServeCommand {
@@ -47,7 +52,7 @@ impl ServeCommand {
 
         let vfs = Vfs::new_default()?;
 
-        let session = Arc::new(ServeSession::new(vfs, project_path)?);
+        let mut session = ServeSession::new(vfs, project_path)?;
 
         let ip = self
             .address
@@ -67,7 +72,14 @@ impl ServeCommand {
             self.allowed_hosts
         };
 
-        let server = LiveServer::new(session);
+        if self.enable_studio_controls {
+            anyhow::ensure!(
+                ip.is_loopback(),
+                "--enable-studio-controls requires a loopback bind address"
+            );
+            session.enable_studio_controls();
+        }
+        let server = LiveServer::new(Arc::new(session));
 
         server.start((ip, port).into(), allowed_hosts, || {
             let _ = show_start_message(ip, port, global.color.into());

@@ -21,6 +21,7 @@ use crate::{
         PatchSet, RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
+    studio::StudioBridge,
 };
 
 /// Contains all of the state for a Rojo serve session. A serve session is used
@@ -85,6 +86,7 @@ pub struct ServeSession {
     /// A channel to send mutation requests on. These will be handled by the
     /// ChangeProcessor and trigger changes in the tree.
     tree_mutation_sender: Sender<PatchSet>,
+    studio_bridge: Arc<StudioBridge>,
 }
 
 impl ServeSession {
@@ -145,11 +147,20 @@ impl ServeSession {
             message_queue,
             tree_mutation_sender,
             vfs,
+            studio_bridge: Arc::new(StudioBridge::new(false)),
         })
     }
 
     pub fn tree_handle(&self) -> Arc<Mutex<RojoTree>> {
         Arc::clone(&self.tree)
+    }
+
+    pub fn enable_studio_controls(&mut self) {
+        self.studio_bridge = Arc::new(StudioBridge::new(true));
+    }
+
+    pub(crate) fn studio_bridge(&self) -> &Arc<StudioBridge> {
+        &self.studio_bridge
     }
 
     pub fn tree(&self) -> MutexGuard<'_, RojoTree> {

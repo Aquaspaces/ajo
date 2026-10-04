@@ -41,6 +41,7 @@ local ApiInfoResponse = t.interface({
 	protocolVersion = t.number,
 	expectedPlaceIds = t.optional(t.array(t.number)),
 	rootInstanceId = RbxId,
+	studioControls = t.optional(t.boolean),
 })
 
 local ApiReadResponse = t.interface({
@@ -49,20 +50,28 @@ local ApiReadResponse = t.interface({
 	instances = t.map(RbxId, ApiInstance),
 })
 
-local SocketPacketType = t.union(t.literal("messages"))
-
 local MessagesPacket = t.interface({
 	messageCursor = t.number,
 	messages = t.array(ApiSubscribeMessage),
 })
 
-local SocketPacketBody = t.union(MessagesPacket)
-
-local ApiSocketPacket = t.interface({
+local ApiMessagesPacket = t.interface({
 	sessionId = t.string,
-	packetType = SocketPacketType,
-	body = SocketPacketBody,
+	packetType = t.literal("messages"),
+	body = MessagesPacket,
 })
+
+local ApiStudioCommandPacket = t.interface({
+	sessionId = t.string,
+	packetType = t.literal("studioCommand"),
+	body = t.interface({
+		requestId = t.string,
+		command = t.union(t.literal("getStatus"), t.literal("getSelection"), t.literal("setSelection")),
+		ids = t.optional(t.array(RbxId)),
+	}),
+})
+
+local ApiSocketPacket = t.union(ApiMessagesPacket, ApiStudioCommandPacket)
 
 local ApiSerializeResponse = t.interface({
 	sessionId = t.string,
@@ -95,6 +104,7 @@ return strict("Types", {
 	ApiInfoResponse = ApiInfoResponse,
 	ApiReadResponse = ApiReadResponse,
 	ApiSocketPacket = ApiSocketPacket,
+	ApiStudioCommandPacket = ApiStudioCommandPacket,
 	ApiError = ApiError,
 
 	ApiInstance = ApiInstance,
