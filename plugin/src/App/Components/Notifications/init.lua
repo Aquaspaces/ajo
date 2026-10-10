@@ -15,18 +15,24 @@ function Notifications:render()
 	local fullscreenNotifs = {}
 
 	for id, notif in self.props.notifications do
+		local actions = {}
+		for name, action in notif.actions or {} do
+			local sharedAction = table.clone(action)
+			sharedAction.handlesDismissal = true
+			sharedAction.onClick = function()
+				self.props.onAction(id, name)
+			end
+			actions[name] = sharedAction
+		end
 		local targetTable = if notif.isFullscreen then fullscreenNotifs else popupNotifs
 		local targetComponent = if notif.isFullscreen then FullscreenNotification else Notification
 		targetTable["NotifID_" .. id] = e(targetComponent, {
 			soundPlayer = self.props.soundPlayer,
 			text = notif.text,
 			timeout = notif.timeout,
-			actions = notif.actions,
+			actions = if notif.actions then actions else nil,
 			layoutOrder = id,
 			onClose = function()
-				if notif.onClose then
-					notif.onClose()
-				end
 				self.props.onClose(id)
 			end,
 		})

@@ -42,6 +42,7 @@ local ApiInfoResponse = t.interface({
 	expectedPlaceIds = t.optional(t.array(t.number)),
 	rootInstanceId = RbxId,
 	studioControls = t.optional(t.boolean),
+	studioPluginControls = t.optional(t.boolean),
 })
 
 local ApiReadResponse = t.interface({
@@ -66,8 +67,23 @@ local ApiStudioCommandPacket = t.interface({
 	packetType = t.literal("studioCommand"),
 	body = t.interface({
 		requestId = t.string,
-		command = t.union(t.literal("getStatus"), t.literal("getSelection"), t.literal("setSelection")),
+		command = t.union(
+			t.literal("getStatus"),
+			t.literal("getSelection"),
+			t.literal("setSelection"),
+			t.literal("getPluginState"),
+			t.literal("getPluginChanges"),
+			t.literal("getPluginDiff"),
+			t.literal("pluginAction")
+		),
 		ids = t.optional(t.array(RbxId)),
+		offset = t.optional(t.number),
+		limit = t.optional(t.number),
+		action = t.optional(t.table),
+		id = t.optional(t.string),
+		property = t.optional(t.string),
+		side = t.optional(t.string),
+		revision = t.optional(t.number),
 	}),
 })
 

@@ -31,6 +31,8 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+* Added agent controls for the Studio plugin's connection, sync confirmation, settings, change inspection, notifications, and window actions. A separate local control connection stays available before sync and after disconnect, with paginated diffs for long properties.
+
 * Added `rojo mcp` for agent access to served projects and opt-in Studio status and selection controls, enabled with `rojo serve --enable-studio-controls`.
 
 ## [7.7.1] (October 1st, 2026)

@@ -104,6 +104,8 @@ function ApiContext.new(baseUrl, createWebSocket)
 		__wsClient = nil,
 		__closeWebSocket = nil,
 		__studioControlsEnabled = false,
+		__studioPluginControlsEnabled = false,
+		__studioHelloSent = false,
 		__createWebSocket = createWebSocket or function(url)
 			return HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, { Url = url })
 		end,
@@ -164,6 +166,7 @@ function ApiContext:connect()
 		:andThen(function(body)
 			self.__sessionId = body.sessionId
 			self.__studioControlsEnabled = body.studioControls == true
+			self.__studioPluginControlsEnabled = body.studioPluginControls == true
 
 			return body
 		end)
@@ -237,14 +240,36 @@ function ApiContext:sendStudioResult(body)
 	}))
 end
 
-function ApiContext:connectWebSocket(packetHandlers, getStudioInfo)
-	local url = ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
+function ApiContext:sendStudioInfo(info)
+	assert(
+		self.__studioHelloSent and self.__connected and self.__wsClient ~= nil,
+		"Studio connection is not registered"
+	)
+	self.__wsClient:Send(Http.jsonEncode({
+		sessionId = self.__sessionId,
+		packetType = "studioHello",
+		body = info,
+	}))
+end
+
+function ApiContext:connectStudioControls(packetHandlers, getStudioInfo)
+	assert(
+		self.__studioControlsEnabled and self.__studioPluginControlsEnabled,
+		"Plugin controls are not enabled by this server"
+	)
+	return self:connectWebSocket(packetHandlers, getStudioInfo, true)
+end
+
+function ApiContext:connectWebSocket(packetHandlers, getStudioInfo, controlsOnly)
+	local url = if controlsOnly
+		then self.__baseUrl .. "/api/studio/socket"
+		else ("%s/api/socket/%s"):format(self.__baseUrl, self.__messageCursor)
 	-- Convert HTTP/HTTPS URL to WS/WSS
 	url = url:gsub("^http://", "ws://"):gsub("^https://", "wss://")
 
 	return Promise.new(function(resolve, reject, onCancel)
-		local success, wsClient = pcall(self.__createWebSocket, url)
-		if not success then
+		local created, wsClient = pcall(self.__createWebSocket, url)
+		if not created then
 			reject("Failed to create WebSocket client: " .. tostring(wsClient))
 			return
 		end
@@ -264,6 +289,7 @@ function ApiContext:connectWebSocket(packetHandlers, getStudioInfo)
 			if self.__wsClient == wsClient then
 				self.__wsClient = nil
 				self.__closeWebSocket = nil
+				self.__studioHelloSent = false
 			end
 			pcall(wsClient.Close, wsClient)
 			if err then
@@ -306,6 +332,9 @@ function ApiContext:connectWebSocket(packetHandlers, getStudioInfo)
 						-- debug type checking is disabled for ordinary sync traffic.
 						assert(Types.ApiStudioCommandPacket(data))
 					else
+						if controlsOnly then
+							return
+						end
 						assert(validateApiSocketPacket(data))
 					end
 
@@ -358,6 +387,7 @@ function ApiContext:connectWebSocket(packetHandlers, getStudioInfo)
 			end)
 			if success then
 				helloSent = true
+				self.__studioHelloSent = true
 			else
 				finish("Failed to register Studio controls: " .. tostring(err))
 			end

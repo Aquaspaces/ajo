@@ -9,7 +9,7 @@ use std::{
 
 use rbx_dom_weak::types::Ref;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -17,6 +17,10 @@ use uuid::Uuid;
 const MAX_CLIENTS: usize = 16;
 const MAX_PENDING: usize = 16;
 pub const MAX_SELECTION: usize = 128;
+pub const MAX_PLUGIN_CHANGES: usize = 100;
+pub const MAX_PLUGIN_DIFF_BYTES: usize = 16 * 1024;
+pub const MAX_PLUGIN_VALUE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PLUGIN_REVISION: u64 = 9_007_199_254_740_991;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,12 +39,220 @@ pub struct StudioClient {
     pub info: StudioInfo,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "command", rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "command", rename_all = "camelCase", deny_unknown_fields)]
 pub enum StudioAction {
-    GetStatus,
-    GetSelection,
-    SetSelection { ids: Vec<Ref> },
+    GetStatus {},
+    GetSelection {},
+    SetSelection {
+        ids: Vec<Ref>,
+    },
+    GetPluginState {},
+    GetPluginChanges {
+        offset: usize,
+        limit: usize,
+    },
+    GetPluginDiff {
+        id: String,
+        property: String,
+        side: DiffSide,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_plugin_diff_limit")]
+        limit: usize,
+        #[serde(
+            default,
+            deserialize_with = "present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        revision: Option<u64>,
+    },
+    PluginAction {
+        action: PluginAction,
+    },
+}
+
+fn default_plugin_diff_limit() -> usize {
+    8192
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffSide {
+    Old,
+    New,
+}
+
+pub fn validate_plugin_diff(
+    id: &str,
+    property: &str,
+    offset: usize,
+    limit: usize,
+    revision: Option<u64>,
+) -> Result<(), &'static str> {
+    if id.is_empty() || id.len() > 128 || property.is_empty() || property.len() > 1024 {
+        return Err("id and property must identify a property from studio_plugin_changes");
+    }
+    if offset > MAX_PLUGIN_VALUE_BYTES || limit == 0 || limit > MAX_PLUGIN_DIFF_BYTES {
+        return Err(
+            "diff offset must be between 0 and 8388608, and limit between 1 and 16384 bytes",
+        );
+    }
+    if (offset > 0 && revision.is_none())
+        || revision.is_some_and(|revision| revision > MAX_PLUGIN_REVISION)
+    {
+        return Err("revision from studio_plugin_changes or studio_plugin_diff is required for offset > 0 and must be an integer between 0 and 9007199254740991");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum PluginAction {
+    Connect {
+        #[serde(
+            default,
+            deserialize_with = "present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        host: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        port: Option<u16>,
+    },
+    Disconnect {},
+    Reconnect {},
+    SetSettings {
+        settings: Map<String, Value>,
+    },
+    RespondConfirmation {
+        confirmation_id: String,
+        decision: ConfirmationDecision,
+    },
+    SetWindow {
+        enabled: bool,
+    },
+    OpenSettings {},
+    CloseSettings {},
+    DismissError {},
+    ForgetProject {},
+    Notification {
+        id: u64,
+        #[serde(
+            default,
+            deserialize_with = "present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        action: Option<String>,
+    },
+    CheckUpdates {},
+    FocusChange {
+        id: String,
+    },
+}
+
+fn present_option<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ConfirmationDecision {
+    Accept,
+    Reject,
+    Abort,
+}
+
+impl PluginAction {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Connect { host, port } => {
+                if host.as_ref().is_some_and(|host| !valid_plugin_host(host)) {
+                    return Err("host must be a hostname or IP address with an optional http/https scheme and no path, port, credentials, or whitespace");
+                }
+                if *port == Some(0) {
+                    return Err("port must be between 1 and 65535");
+                }
+            }
+            Self::SetSettings { settings } => {
+                if settings.is_empty() || settings.len() > 64 {
+                    return Err("settings must contain between 1 and 64 entries");
+                }
+                if settings.iter().any(|(name, value)| {
+                    name.is_empty()
+                        || name.len() > 128
+                        || !matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_))
+                        || value.as_str().is_some_and(|value| value.len() > 1024)
+                }) {
+                    return Err("settings must contain named boolean, number, or string values");
+                }
+            }
+            Self::RespondConfirmation {
+                confirmation_id, ..
+            } => {
+                if confirmation_id.is_empty() || confirmation_id.len() > 256 {
+                    return Err("confirmationId must identify the current confirmation from studio_plugin_state");
+                }
+            }
+            Self::Notification { id, action } => {
+                if *id == 0
+                    || *id > i32::MAX as u64
+                    || action
+                        .as_ref()
+                        .is_some_and(|action| action.is_empty() || action.len() > 256)
+                {
+                    return Err("notification id and action must identify an entry from studio_plugin_state");
+                }
+            }
+            Self::FocusChange { id } if id.is_empty() || id.len() > 128 => {
+                return Err("id must identify an entry from studio_plugin_changes");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn valid_plugin_host(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 261
+        || host.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || character == '\\'
+        })
+    {
+        return false;
+    }
+    let authority = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .unwrap_or(host);
+    if authority.is_empty()
+        || authority.contains('/')
+        || (authority.starts_with('[') && !authority.ends_with(']'))
+        || (!authority.starts_with('[') && authority.contains(':'))
+    {
+        return false;
+    }
+    let origin = format!("http://{authority}");
+    reqwest::Url::parse(&origin).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.port().is_none()
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -153,12 +365,36 @@ impl StudioBridge {
         timeout: Duration,
     ) -> Reply {
         self.require_enabled()?;
-        if let StudioAction::SetSelection { ids } = &action {
-            if ids.len() > MAX_SELECTION {
+        match &action {
+            StudioAction::SetSelection { ids } if ids.len() > MAX_SELECTION => {
                 return Err(StudioError::Invalid(
                     "at most 128 selection IDs are allowed".into(),
                 ));
             }
+            StudioAction::GetPluginChanges { limit, .. }
+                if *limit == 0 || *limit > MAX_PLUGIN_CHANGES =>
+            {
+                return Err(StudioError::Invalid(
+                    "limit must be between 1 and 100".into(),
+                ));
+            }
+            StudioAction::PluginAction { action } => {
+                action
+                    .validate()
+                    .map_err(|message| StudioError::Invalid(message.into()))?;
+            }
+            StudioAction::GetPluginDiff {
+                id,
+                property,
+                offset,
+                limit,
+                revision,
+                ..
+            } => {
+                validate_plugin_diff(id, property, *offset, *limit, *revision)
+                    .map_err(|message| StudioError::Invalid(message.into()))?;
+            }
+            _ => {}
         }
         let request_id = Uuid::new_v4().to_string();
         let receiver = {
@@ -210,6 +446,16 @@ pub struct StudioConnection {
 }
 
 impl StudioConnection {
+    pub fn update_info(&self, info: StudioInfo) -> Result<(), StudioError> {
+        if info.place_name.len() > 1024 {
+            return Err(StudioError::Invalid("placeName is too long".into()));
+        }
+        let mut clients = self.bridge.clients.lock().unwrap();
+        let client = clients.get_mut(&self.id).ok_or(StudioError::Disconnected)?;
+        client.info = info;
+        Ok(())
+    }
+
     pub fn is_pending(&self, request_id: &str) -> bool {
         self.bridge
             .clients
@@ -268,12 +514,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plugin_hosts_accept_ui_endpoints_without_credentials_or_paths() {
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "http://localhost",
+            "https://example.com",
+            "http://[::1]",
+        ] {
+            assert!(valid_plugin_host(host), "{host}");
+        }
+        for host in [
+            "",
+            " localhost",
+            "host\n",
+            "http://user@host",
+            "host/path",
+            "host?query",
+            "host#fragment",
+            "ftp://host",
+            "host:34872",
+            "host\\path",
+            "http://localhost/",
+            "http://localhost:80",
+            "https://localhost:443",
+            "http://[::1]:80",
+        ] {
+            assert!(!valid_plugin_host(host), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshed_metadata_preserves_client_identity_and_pending_requests() {
+        let bridge = Arc::new(StudioBridge::new(true));
+        let (connection, mut requests) = bridge.register(info()).unwrap();
+        let (result, _) = tokio::join!(
+            bridge.request(&connection.id, StudioAction::GetPluginState {}),
+            async {
+                let request = requests.recv().await.unwrap();
+                connection
+                    .update_info(StudioInfo {
+                        place_id: 99,
+                        game_id: 100,
+                        place_name: "New place".into(),
+                    })
+                    .unwrap();
+                let clients = bridge.clients().unwrap();
+                assert_eq!(clients.len(), 1);
+                assert_eq!(clients[0].client_id, connection.id);
+                assert_eq!(clients[0].info.place_id, 99);
+                assert_eq!(clients[0].info.place_name, "New place");
+                assert!(connection.complete(&request.request_id, Ok(json!({"placeId":99}))));
+            }
+        );
+        assert_eq!(result.unwrap(), json!({"placeId":99}));
+    }
+
+    #[tokio::test]
+    async fn invalid_plugin_requests_fail_before_queueing() {
+        let bridge = Arc::new(StudioBridge::new(true));
+        let (connection, mut requests) = bridge.register(info()).unwrap();
+        for action in [
+            StudioAction::GetPluginChanges {
+                offset: 0,
+                limit: 0,
+            },
+            StudioAction::GetPluginChanges {
+                offset: 0,
+                limit: 101,
+            },
+            StudioAction::PluginAction {
+                action: PluginAction::Connect {
+                    host: None,
+                    port: Some(0),
+                },
+            },
+            StudioAction::PluginAction {
+                action: PluginAction::SetSettings {
+                    settings: Map::new(),
+                },
+            },
+            StudioAction::PluginAction {
+                action: PluginAction::RespondConfirmation {
+                    confirmation_id: String::new(),
+                    decision: ConfirmationDecision::Accept,
+                },
+            },
+        ] {
+            assert!(matches!(
+                bridge.request(&connection.id, action).await,
+                Err(StudioError::Invalid(_))
+            ));
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn replies_are_owned_by_the_connection_and_only_complete_once() {
         let bridge = Arc::new(StudioBridge::new(true));
         let (first, mut requests) = bridge.register(info()).unwrap();
         let (second, _) = bridge.register(info()).unwrap();
-        let request = bridge.request(&first.id, StudioAction::GetStatus);
+        let request = bridge.request(&first.id, StudioAction::GetStatus {});
         let reply = async {
             let command = requests.recv().await.unwrap();
             assert!(!second.complete(&command.request_id, Ok(json!("wrong client"))));
@@ -289,15 +632,16 @@ mod tests {
         let bridge = Arc::new(StudioBridge::new(true));
         let (connection, mut requests) = bridge.register(info()).unwrap();
         let old_id = connection.id.clone();
-        let (result, _) = tokio::join!(bridge.request(&old_id, StudioAction::GetStatus), async {
-            requests.recv().await.unwrap();
-            drop(connection);
-        });
+        let (result, _) =
+            tokio::join!(bridge.request(&old_id, StudioAction::GetStatus {}), async {
+                requests.recv().await.unwrap();
+                drop(connection);
+            });
         assert!(matches!(result, Err(StudioError::Disconnected)));
         let (new, _) = bridge.register(info()).unwrap();
         assert_ne!(new.id, old_id);
         assert!(matches!(
-            bridge.request(&old_id, StudioAction::GetStatus).await,
+            bridge.request(&old_id, StudioAction::GetStatus {}).await,
             Err(StudioError::NotFound)
         ));
     }
@@ -309,7 +653,7 @@ mod tests {
         let result = bridge
             .request_with_timeout(
                 &connection.id,
-                StudioAction::GetStatus,
+                StudioAction::GetStatus {},
                 Duration::from_millis(1),
             )
             .await;
@@ -317,7 +661,7 @@ mod tests {
         let command = requests.recv().await.unwrap();
         assert!(!connection.is_pending(&command.request_id));
         assert!(!connection.complete(&command.request_id, Ok(json!({}))));
-        let mut request = Box::pin(bridge.request(&connection.id, StudioAction::GetStatus));
+        let mut request = Box::pin(bridge.request(&connection.id, StudioAction::GetStatus {}));
         assert!(futures::poll!(&mut request).is_pending());
         let command = requests.recv().await.unwrap();
         drop(request);
@@ -336,13 +680,13 @@ mod tests {
         let (connection, _requests) = bridge.register(info()).unwrap();
         let mut pending = Vec::new();
         for _ in 0..MAX_PENDING {
-            let mut future = Box::pin(bridge.request(&connection.id, StudioAction::GetStatus));
+            let mut future = Box::pin(bridge.request(&connection.id, StudioAction::GetStatus {}));
             assert!(futures::poll!(&mut future).is_pending());
             pending.push(future);
         }
         assert!(matches!(
             bridge
-                .request(&connection.id, StudioAction::GetStatus)
+                .request(&connection.id, StudioAction::GetStatus {})
                 .await,
             Err(StudioError::Busy)
         ));

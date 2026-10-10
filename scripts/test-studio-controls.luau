@@ -15,6 +15,10 @@ local state = { Connecting = "Connecting", Open = "Open", Closed = "Closed", Err
 local enum = { WebStreamClientState = state, WebStreamClientType = { WebSocket = "WebSocket" } }
 local gameServices = {
 	HttpService = {},
+	StudioService = {},
+	ChangeHistoryService = {},
+	SerializationService = {},
+	Selection = {},
 	RunService = { Heartbeat = {
 		Wait = function()
 			task.wait()
@@ -54,9 +58,9 @@ local modules = {
 local function requireModule(reference)
 	return assert(modules[reference], "Unexpected module: " .. tostring(reference))
 end
-local packages = { Http = "Http", Log = "Log", Promise = "Promise", t = "t" }
+local packages = { Http = "Http", Log = "Log", Promise = "Promise", t = "t", Fmt = "Fmt" }
 local parent = { Parent = { Packages = packages } }
-for _, name in ipairs({ "StudioControls", "ApiContext", "Types", "Config", "Version", "Settings", "strict" }) do
+for _, name in ipairs({ "StudioControls", "PluginBridge", "ApiContext", "Types", "Config", "Version", "Settings", "strict" }) do
 	parent[name] = name
 end
 local environment = {
@@ -68,6 +72,16 @@ local environment = {
 }
 modules.Types = load("plugin/src/Types.lua", environment)
 modules.ApiContext = load("plugin/src/ApiContext.lua", environment)
+modules.PluginBridge = load("plugin/src/PluginBridge.lua", environment)
+for _, name in ipairs({ "ServeSession", "Timer", "InstanceMap", "PatchSet", "Reconciler", "orderSwaps" }) do
+	parent[name] = name
+	modules[name] = {}
+end
+parent.ChangeBatcher = { encodePatchUpdate = "encodePatchUpdate" }
+modules[parent.ChangeBatcher] = {}
+modules.encodePatchUpdate = function() end
+modules.Fmt = { debugify = function() return "patch" end }
+modules.ServeSession = load("plugin/src/ServeSession.lua", environment)
 
 local passed = 0
 local failed = 0
@@ -93,7 +107,7 @@ specEnvironment.expect = function(actual)
 	}
 end
 
-for _, name in ipairs({ "StudioControls", "ApiContext" }) do
+for _, name in ipairs({ "StudioControls", "ApiContext", "PluginBridge", "ServeSession" }) do
 	load("plugin/src/" .. name .. ".spec.lua", specEnvironment)()
 end
 print(string.format("Mocked Studio controls and transport suite: %d passed, %d failed", passed, failed))
