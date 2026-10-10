@@ -167,6 +167,8 @@ pub struct ServerInfoResponse {
     pub root_instance_id: Ref,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub studio_controls: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_plugin_controls: bool,
 }
 
 /// Response body from /api/read/{id}

@@ -11,8 +11,8 @@ return function()
 		function signal:Connect(callback)
 			local connection = {}
 			self.listeners[connection] = callback
-			function connection:Disconnect()
-				signal.listeners[self] = nil
+			function connection.Disconnect()
+				signal.listeners[connection] = nil
 			end
 			return connection
 		end
@@ -26,7 +26,7 @@ return function()
 		return signal
 	end
 
-	local function createFixture(enabled, state)
+	local function createFixture(enabled, state, controlsOnly)
 		local client = {
 			Opened = createSignal(),
 			Closed = createSignal(),
@@ -45,14 +45,18 @@ return function()
 			self.Closed:Fire()
 		end
 		local api = ApiContext.new("http://localhost:34872", function(url)
-			expect(url).to.equal("ws://localhost:34872/api/socket/0")
+			expect(url).to.equal(
+				if controlsOnly then "ws://localhost:34872/api/studio/socket" else "ws://localhost:34872/api/socket/0"
+			)
 			return client
 		end)
 		api.__sessionId = SESSION_ID
 		api.__studioControlsEnabled = enabled
+		api.__studioPluginControlsEnabled = controlsOnly == true
 		api:setMessageCursor(0)
 		local function connect(handlers)
-			local promise = api:connectWebSocket(handlers or {}, function()
+			local method = if controlsOnly then api.connectStudioControls else api.connectWebSocket
+			local promise = method(api, handlers or {}, function()
 				return { placeId = 123, gameId = 456, placeName = "Test place" }
 			end)
 			promise:catch(function() end)
@@ -206,5 +210,57 @@ return function()
 		expect(next(client.MessageReceived.listeners)).to.equal(nil)
 		expect(next(client.Opened.listeners)).to.equal(nil)
 		api:disconnect()
+	end)
+
+	it("uses an independent plugin control socket before any sync read or confirmation", function()
+		local api, client, connect = createFixture(true, Enum.WebStreamClientState.Open, true)
+		api:setMessageCursor(-1)
+		local received
+		local patches = 0
+		connect({
+			studioCommand = function(packet)
+				received = packet
+			end,
+			messages = function()
+				patches += 1
+			end,
+		})
+		client.MessageReceived:Fire(Http.jsonEncode({
+			sessionId = SESSION_ID,
+			packetType = "studioCommand",
+			body = { requestId = REQUEST_ID, command = "pluginAction", action = { type = "connect" } },
+		}))
+		expect(received.action.type).to.equal("connect")
+		client.MessageReceived:Fire(Http.msgpackEncode({
+			sessionId = SESSION_ID,
+			packetType = "messages",
+			body = { messageCursor = 7, messages = {} },
+		}))
+		expect(patches).to.equal(0)
+		api:disconnect()
+	end)
+
+	it("requires the plugin control capability before opening a dedicated socket", function()
+		local api = createFixture(true)
+		expect(pcall(function()
+			api:connectStudioControls({}, function()
+				return {}
+			end)
+		end)).to.equal(false)
+		api:disconnect()
+	end)
+
+	it("refreshes live Studio identity on the same registered control socket", function()
+		local api, client, connect = createFixture(true, Enum.WebStreamClientState.Open, true)
+		connect()
+		api:sendStudioInfo({ placeId = 789, gameId = 456, placeName = "Renamed place" })
+		local packet = Http.jsonDecode(client.sent[2])
+		expect(packet.packetType).to.equal("studioHello")
+		expect(packet.body.placeId).to.equal(789)
+		expect(packet.body.placeName).to.equal("Renamed place")
+		api:disconnect()
+		expect(pcall(function()
+			api:sendStudioInfo({})
+		end)).to.equal(false)
 	end)
 end

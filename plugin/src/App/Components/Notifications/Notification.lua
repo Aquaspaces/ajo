@@ -6,7 +6,7 @@ local Packages = Rojo.Packages
 
 local Roact = require(Packages.Roact)
 local Flipper = require(Packages.Flipper)
-local Log = require(Packages.Log)
+local activateAction = require(script.Parent.activateAction)
 
 local Theme = require(Plugin.App.Theme)
 local Assets = require(Plugin.Assets)
@@ -101,13 +101,7 @@ function Notification:render()
 					text = action.text,
 					style = action.style,
 					onClick = function()
-						self:dismiss()
-						if action.onClick then
-							local success, err = pcall(action.onClick, self)
-							if not success then
-								Log.warn("Error in notification action: " .. tostring(err))
-							end
-						end
+						activateAction(self, action)
 					end,
 					layoutOrder = -action.layoutOrder,
 					transparency = transparency,

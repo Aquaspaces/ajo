@@ -101,6 +101,7 @@ impl ApiService {
             game_id: self.serve_session.game_id(),
             root_instance_id,
             studio_controls: self.serve_session.studio_bridge().enabled(),
+            studio_plugin_controls: self.serve_session.studio_bridge().enabled(),
         })
     }
 

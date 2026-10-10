@@ -2,6 +2,7 @@ local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
 local RunService = game:GetService("RunService")
+local Selection = game:GetService("Selection")
 
 local Rojo = script:FindFirstAncestor("Rojo")
 local Plugin = Rojo.Plugin
@@ -19,6 +20,9 @@ local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
+local PluginBridge = require(Plugin.PluginBridge)
+local StudioControls = require(Plugin.StudioControls)
+local PluginController = require(Plugin.PluginController)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
 local preloadAssets = require(Plugin.preloadAssets)
@@ -57,8 +61,9 @@ function App:init()
 	self.host, self.setHost = Roact.createBinding(priorSyncInfo.host or "")
 	self.port, self.setPort = Roact.createBinding(priorSyncInfo.port or "")
 
-	self.confirmationBindable = Instance.new("BindableEvent")
-	self.confirmationEvent = self.confirmationBindable.Event
+	self.confirmationSequence = 0
+	self.diffRevision = 0
+	self.diffUpdating = 0
 	self.knownProjects = {}
 	self.notifId = 0
 
@@ -136,6 +141,7 @@ function App:init()
 		notifications = {},
 		toolbarIcon = Assets.Images.PluginButton,
 	})
+	self.pluginController = PluginController.new(self)
 
 	if RunService:IsEdit() then
 		self:checkForUpdates()
@@ -173,11 +179,66 @@ function App:init()
 	end)
 end
 
+function App:didMount()
+	local disconnectedControls = StudioControls.new({ fromIds = {}, fromInstances = {} }, {
+		game = game,
+		runService = RunService,
+		selection = Selection,
+	})
+	self.pluginBridge = PluginBridge.new({
+		getEndpoints = function()
+			local host, port = self:getHostAndPort()
+			local endpoint = if string.find(host, "^https?://")
+				then string.format("%s:%s", host, port)
+				else string.format("http://%s:%s", host, port)
+			return { endpoint, string.format("http://%s:%s", Config.defaultHost, Config.defaultPort) }
+		end,
+		getInfo = function()
+			return { placeId = game.PlaceId, gameId = game.GameId, placeName = game.Name }
+		end,
+		execute = function(packet, api)
+			if
+				packet.command == "getStatus"
+				or packet.command == "getSelection"
+				or packet.command == "setSelection"
+			then
+				if packet.command == "setSelection" then
+					self:assertSessionIdle()
+				end
+				local session = self.serveSession
+				-- Rojo IDs are scoped to the served project. A control connection
+				-- can stay open while the plugin syncs a different server.
+				local controls = if session and session.__apiContext.__sessionId == api.__sessionId
+					then session.__studioControls
+					else disconnectedControls
+				return controls:execute(packet.command, packet.ids)
+			end
+			return self.pluginController:execute(packet)
+		end,
+	})
+	self.pluginBridge:start()
+	self.pluginInfoConnections = {}
+	for _, property in ipairs({ "PlaceId", "GameId", "Name" }) do
+		table.insert(
+			self.pluginInfoConnections,
+			game:GetPropertyChangedSignal(property):Connect(function()
+				self.pluginBridge:refreshInfo()
+			end)
+		)
+	end
+end
+
 function App:willUnmount()
-	self:endSession()
+	self.unmounting = true
+	if self.pluginBridge then
+		self.pluginBridge:stop()
+	end
+	for _, connection in self.pluginInfoConnections or {} do
+		connection:Disconnect()
+	end
+	self:endSession(true)
 
 	self.waypointConnection:Disconnect()
-	self.confirmationBindable:Destroy()
 
 	self.disconnectUpdatesCheckChanged()
 	self.disconnectPrereleasesCheckChanged()
@@ -223,7 +284,8 @@ function App:addNotification(notif: {
 end
 
 function App:closeNotification(id: number)
-	if not self.state.notifications[id] then
+	local notification = self.state.notifications[id]
+	if not notification then
 		return
 	end
 
@@ -235,6 +297,86 @@ function App:closeNotification(id: number)
 			notifications = notifications,
 		}
 	end)
+	if notification.onClose then
+		notification.onClose()
+	end
+end
+
+function App:notificationAction(id, actionName)
+	self:assertSessionIdle()
+	local notification = self.state.notifications[id]
+	assert(notification ~= nil, "Notification is no longer available")
+	local action
+	if actionName ~= nil then
+		action = notification.actions and notification.actions[actionName]
+		assert(action ~= nil, "Unknown notification action")
+	end
+	self:closeNotification(id)
+	if action and action.onClick then
+		action.onClick()
+	end
+end
+
+function App:assertSessionIdle()
+	local controls = self.serveSession and self.serveSession.__studioControls
+	assert(not controls or controls.__syncDepth == 0, "Studio is applying a sync update; try again after it finishes")
+end
+
+function App:bumpDiffRevision()
+	self.diffRevision = (self.diffRevision or 0) + 1
+end
+
+function App:setWindow(enabled)
+	self:setState({ guiEnabled = enabled })
+end
+
+function App:openSettings()
+	assert(
+		self.state.appStatus == AppStatus.NotConnected
+			or self.state.appStatus == AppStatus.Connected
+			or self.state.appStatus == AppStatus.Settings,
+		"Settings are unavailable during connection or confirmation"
+	)
+	if self.state.appStatus ~= AppStatus.Settings then
+		self.backPage = self.state.appStatus
+		self:setState({ appStatus = AppStatus.Settings })
+	end
+end
+
+function App:closeSettings()
+	assert(self.state.appStatus == AppStatus.Settings, "Settings are not open")
+	self:setState({ appStatus = self.backPage or AppStatus.NotConnected })
+end
+
+function App:dismissError()
+	assert(self.state.appStatus == AppStatus.Error, "No plugin error is open")
+	self:setState({ appStatus = AppStatus.NotConnected, toolbarIcon = Assets.Images.PluginButton })
+end
+
+function App:focusChange(id)
+	self:assertSessionIdle()
+	local node = self.state.patchTree and self.state.patchTree:getNode(id)
+	assert(
+		node and node.instance and (node.instance == game or node.instance:IsDescendantOf(game)),
+		"Changed instance is no longer available in Studio"
+	)
+	Selection:Set({ node.instance })
+end
+
+function App:respondConfirmation(id, decision)
+	local pending = self.pendingConfirmation
+	assert(
+		pending and pending.id == id and pending.session == self.serveSession and pending.decision == nil,
+		"Confirmation is no longer pending"
+	)
+	assert(
+		decision == "Accept" or decision == "Reject" or decision == "Abort",
+		"Decision must be Accept, Reject, or Abort"
+	)
+	assert(decision ~= "Reject" or pending.twoWaySync, "Reject requires two-way sync")
+	pending.decision = decision
+	self.pendingConfirmation = nil
+	pending.event:Fire()
 end
 
 function App:checkForUpdates()
@@ -601,6 +743,9 @@ function App:useRunningConnectionInfo()
 end
 
 function App:startSession()
+	if self.unmounting or self.serveSession ~= nil then
+		return
+	end
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
@@ -632,18 +777,46 @@ function App:startSession()
 	})
 
 	serveSession:setUpdateLoadingTextCallback(function(text: string)
+		if self.serveSession ~= serveSession then
+			return
+		end
 		self:setState({
 			connectingText = text,
 		})
 	end)
 
 	self.cleanupPrecommit = serveSession:hookPrecommit(function(patch, instanceMap)
+		if self.serveSession ~= serveSession then
+			return
+		end
 		-- Build new tree for patch
+		local patchTree = PatchTree.build(patch, instanceMap, { "Property", "Old", "New" })
+		if self.serveSession ~= serveSession then
+			return
+		end
+		self:bumpDiffRevision()
 		self:setState({
-			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Old", "New" }),
+			patchTree = patchTree,
 		})
 	end)
 	self.cleanupPostcommit = serveSession:hookPostcommit(function(patch, instanceMap, unappliedPatch)
+		if self.serveSession ~= serveSession then
+			return
+		end
+		local previousTree = self.state.patchTree
+		-- Metadata shares nodes with the displayed tree. Do not let a chunked
+		-- read observe those nodes halfway through a yielding update.
+		self.diffUpdating = (self.diffUpdating or 0) + 1
+		self:bumpDiffRevision()
+		local success, patchTree = pcall(PatchTree.updateMetadata, previousTree, patch, instanceMap, unappliedPatch)
+		self.diffUpdating -= 1
+		self:bumpDiffRevision()
+		if not success then
+			error(patchTree, 0)
+		end
+		if self.serveSession ~= serveSession or self.state.patchTree ~= previousTree then
+			return
+		end
 		local now = DateTime.now().UnixTimestamp
 		self:setState(function(prevState)
 			local oldPatchData = prevState.patchData
@@ -664,13 +837,16 @@ function App:startSession()
 			end
 
 			return {
-				patchTree = PatchTree.updateMetadata(prevState.patchTree, patch, instanceMap, unappliedPatch),
+				patchTree = patchTree,
 				patchData = newPatchData,
 			}
 		end)
 	end)
 
 	serveSession:onStatusChanged(function(status, details)
+		if self.serveSession ~= serveSession then
+			return
+		end
 		if status == ServeSession.Status.Connecting then
 			if self.dismissSyncReminder then
 				self.dismissSyncReminder()
@@ -700,10 +876,18 @@ function App:startSession()
 				text = string.format("Connected to session '%s' at %s.", details, address),
 			})
 		elseif status == ServeSession.Status.Disconnected then
+			local pending = self.pendingConfirmation
+			if pending and pending.session == serveSession then
+				pending.decision = "Abort"
+				self.pendingConfirmation = nil
+				pending.event:Fire()
+			end
 			self.serveSession = nil
 			self:releaseSyncLock()
 			self:clearRunningConnectionInfo()
+			self:bumpDiffRevision()
 			self:setState({
+				patchTree = Roact.None,
 				patchData = {
 					patch = PatchSet.newEmpty(),
 					unapplied = PatchSet.newEmpty(),
@@ -739,6 +923,9 @@ function App:startSession()
 	end)
 
 	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+		if self.serveSession ~= serveSession then
+			return "Abort"
+		end
 		if PatchSet.isEmpty(patch) then
 			Log.trace("Accepting patch without confirmation because it is empty")
 			return "Accept"
@@ -804,11 +991,27 @@ function App:startSession()
 		self:setState({
 			connectingText = "Computing diff view...",
 		})
+		local patchTree = PatchTree.build(patch, instanceMap, { "Property", "Current", "Incoming" })
+		if self.serveSession ~= serveSession then
+			return "Abort"
+		end
+		self.confirmationSequence += 1
+		local pending = {
+			id = "confirmation-" .. self.confirmationSequence,
+			session = serveSession,
+			serverInfo = serverInfo,
+			patch = patch,
+			twoWaySync = serveSession.__twoWaySync,
+			event = Instance.new("BindableEvent"),
+		}
+		self.pendingConfirmation = pending
+		self:bumpDiffRevision()
 		self:setState({
 			appStatus = AppStatus.Confirming,
-			patchTree = PatchTree.build(patch, instanceMap, { "Property", "Current", "Incoming" }),
+			patchTree = patchTree,
 			confirmData = {
 				serverInfo = serverInfo,
+				confirmationId = pending.id,
 			},
 			toolbarIcon = Assets.Images.PluginButton,
 		})
@@ -821,17 +1024,27 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		-- A remote action may arrive before this coroutine begins waiting.
+		if pending.decision == nil then
+			pending.event.Event:Wait()
+		end
+		pending.event:Destroy()
+		if self.pendingConfirmation == pending then
+			self.pendingConfirmation = nil
+		end
+		return pending.decision or "Abort"
 	end)
 
-	serveSession:start()
-
 	self.serveSession = serveSession
+	serveSession:start()
 end
 
-function App:endSession()
+function App:endSession(force)
 	if self.serveSession == nil then
 		return
+	end
+	if not force then
+		self:assertSessionIdle()
 	end
 
 	Log.trace("Disconnecting session")
@@ -854,6 +1067,7 @@ end
 
 function App:render()
 	local pluginName = "Rojo " .. Version.display(Config.version)
+	local confirmationId = self.state.confirmData.confirmationId
 
 	local function createPageElement(appStatus, additionalProps)
 		additionalProps = additionalProps or {}
@@ -891,9 +1105,7 @@ function App:render()
 					end,
 
 					onClose = function()
-						self:setState({
-							guiEnabled = false,
-						})
+						self:setWindow(false)
 					end,
 				}, {
 					Tooltips = e(Tooltip.Container, nil),
@@ -909,10 +1121,7 @@ function App:render()
 						end,
 
 						onNavigateSettings = function()
-							self.backPage = AppStatus.NotConnected
-							self:setState({
-								appStatus = AppStatus.Settings,
-							})
+							self:openSettings()
 						end,
 					}),
 
@@ -922,13 +1131,13 @@ function App:render()
 						createPopup = not self.state.guiEnabled,
 
 						onAbort = function()
-							self.confirmationBindable:Fire("Abort")
+							self:respondConfirmation(confirmationId, "Abort")
 						end,
 						onAccept = function()
-							self.confirmationBindable:Fire("Accept")
+							self:respondConfirmation(confirmationId, "Accept")
 						end,
 						onReject = function()
-							self.confirmationBindable:Fire("Reject")
+							self:respondConfirmation(confirmationId, "Reject")
 						end,
 					}),
 
@@ -948,21 +1157,15 @@ function App:render()
 						end,
 
 						onNavigateSettings = function()
-							self.backPage = AppStatus.Connected
-							self:setState({
-								appStatus = AppStatus.Settings,
-							})
+							self:openSettings()
 						end,
 					}),
 
 					Settings = createPageElement(AppStatus.Settings, {
-						syncActive = self.serveSession ~= nil
-							and self.serveSession:getStatus() == ServeSession.Status.Connected,
+						syncActive = self.serveSession ~= nil,
 
 						onBack = function()
-							self:setState({
-								appStatus = self.backPage or AppStatus.NotConnected,
-							})
+							self:closeSettings()
 						end,
 					}),
 
@@ -970,10 +1173,7 @@ function App:render()
 						errorMessage = self.state.errorMessage,
 
 						onClose = function()
-							self:setState({
-								appStatus = AppStatus.NotConnected,
-								toolbarIcon = Assets.Images.PluginButton,
-							})
+							self:dismissError()
 						end,
 					}),
 				}),
@@ -988,6 +1188,9 @@ function App:render()
 						notifications = self.state.notifications,
 						onClose = function(id)
 							self:closeNotification(id)
+						end,
+						onAction = function(id, action)
+							self:notificationAction(id, action)
 						end,
 					}),
 				}),
@@ -1046,11 +1249,7 @@ function App:render()
 					active = self.state.guiEnabled,
 					enabled = true,
 					onClick = function()
-						self:setState(function(state)
-							return {
-								guiEnabled = not state.guiEnabled,
-							}
-						end)
+						self:setWindow(not self.state.guiEnabled)
 					end,
 				}),
 			}),

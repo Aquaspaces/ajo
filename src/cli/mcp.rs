@@ -21,7 +21,15 @@ use reqwest::{blocking::Client, redirect::Policy, Url};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use crate::{web::util::deserialize_msgpack, web_api::ReadResponse, SessionId};
+use crate::{
+    studio::{
+        validate_plugin_diff, DiffSide, PluginAction, StudioAction, MAX_PLUGIN_CHANGES,
+        MAX_PLUGIN_DIFF_BYTES, MAX_PLUGIN_REVISION, MAX_PLUGIN_VALUE_BYTES,
+    },
+    web::util::deserialize_msgpack,
+    web_api::ReadResponse,
+    SessionId,
+};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -432,6 +440,23 @@ fn tools() -> Vec<Value> {
     let mut selection = client.clone();
     selection["properties"]["ids"] = ids;
     selection["required"] = json!(["clientId", "ids"]);
+    let mut changes = client.clone();
+    changes["properties"]["offset"] = json!({"type": "integer", "minimum": 0, "default": 0});
+    changes["properties"]["limit"] =
+        json!({"type": "integer", "minimum": 1, "maximum": MAX_PLUGIN_CHANGES, "default": 50});
+    let mut action = client.clone();
+    action["properties"]["action"] = plugin_action_schema();
+    action["required"] = json!(["clientId", "action"]);
+    let mut diff = client.clone();
+    diff["properties"]["id"] = json!({"type":"string", "minLength":1, "maxLength":128});
+    diff["properties"]["property"] = json!({"type":"string", "minLength":1, "maxLength":1024});
+    diff["properties"]["side"] = json!({"type":"string", "enum":["old", "new"]});
+    diff["properties"]["offset"] =
+        json!({"type":"integer", "minimum":0, "maximum":MAX_PLUGIN_VALUE_BYTES, "default":0});
+    diff["properties"]["revision"] = json!({"type":"integer", "minimum":0, "maximum":MAX_PLUGIN_REVISION, "description":"Revision returned by studio_plugin_changes or studio_plugin_diff. Required for offset > 0 to prevent mixing chunks from different changes."});
+    diff["properties"]["limit"] =
+        json!({"type":"integer", "minimum":1, "maximum":MAX_PLUGIN_DIFF_BYTES, "default":8192});
+    diff["required"] = json!(["clientId", "id", "property", "side"]);
     vec![
         json!({"name": "rojo_project", "description": "Read the served project's name, session ID, root instance ID, and server information.", "inputSchema": empty}),
         json!({"name": "rojo_read_instances", "description": "Read served filesystem instances and their descendants by Rojo ID. Missing IDs are omitted. This is not the live Studio hierarchy.", "inputSchema": {"type": "object", "properties": {"ids": read_ids}, "required": ["ids"], "additionalProperties": false}}),
@@ -439,7 +464,35 @@ fn tools() -> Vec<Value> {
         json!({"name": "studio_status", "description": "Request live status from a specific Studio client and wait for its response.", "inputSchema": client}),
         json!({"name": "studio_get_selection", "description": "Read the current selection in a specific Studio client. Unsynced selections may have no Rojo ID.", "inputSchema": client}),
         json!({"name": "studio_set_selection", "description": "Change a specific Studio client's selection to these synced Rojo IDs and wait for Studio's acknowledgement. An empty ids array clears the selection.", "inputSchema": selection}),
+        json!({"name": "studio_plugin_state", "description": "Read the live ajo plugin state, connection, settings metadata, pending confirmation, notifications, and window state. The current plugin discovers an enabled local serve even while sync is disconnected; check placeId against rojo_project before acting.", "inputSchema": client}),
+        json!({"name": "studio_plugin_changes", "description": "Read a bounded page of the plugin's pending confirmation changes or recent sync changes without opening the changes viewer. Use offset and limit to inspect further entries.", "inputSchema": changes}),
+        json!({"name": "studio_plugin_diff", "description": "Read a bounded UTF-8 byte range from a change's old or new property value, including complete script source. Values up to 8 MiB are supported; non-string values are encoded as JSON. Use an id and property from studio_plugin_changes. Returns value, encoding, totalBytes, offset, nextOffset, and revision; pass both nextOffset and revision to read the next chunk. A revision change requires restarting the read.", "inputSchema": diff}),
+        json!({"name": "studio_plugin_action", "description": "Perform a plugin UI action and wait for the plugin's acknowledgement: connect, disconnect, reconnect, change settings, respond to the current confirmation, control windows, dismiss errors, forget a saved project, handle notifications, focus a change, or check updates. Read studio_plugin_state for valid settings, confirmationId, and notification actions. Inspect state after connect/reconnect to observe progress; acceptance does not mean synchronization finished. Confirmation decisions are Accept, Reject (write current Studio values back to served files through two-way sync), or Abort (disconnect).", "inputSchema": action}),
     ]
+}
+
+fn plugin_action_schema() -> Value {
+    let mut variants = Vec::new();
+    for name in [
+        "disconnect",
+        "reconnect",
+        "openSettings",
+        "closeSettings",
+        "dismissError",
+        "forgetProject",
+        "checkUpdates",
+    ] {
+        variants.push(json!({"type":"object", "properties":{"type":{"const":name}}, "required":["type"], "additionalProperties":false}));
+    }
+    variants.extend([
+        json!({"type":"object", "properties":{"type":{"const":"connect"}, "host":{"type":"string", "minLength":1, "maxLength":261, "description":"Hostname or IP address, optionally prefixed by http:// or https://; omit to use the plugin's current endpoint."}, "port":{"type":"integer", "minimum":1, "maximum":65535}}, "required":["type"], "additionalProperties":false}),
+        json!({"type":"object", "properties":{"type":{"const":"setSettings"}, "settings":{"type":"object", "minProperties":1, "maxProperties":64, "additionalProperties":{"type":["boolean", "number", "string"]}, "description":"Setting names and permitted values come from studio_plugin_state. The plugin validates the complete patch before applying it."}}, "required":["type", "settings"], "additionalProperties":false}),
+        json!({"type":"object", "properties":{"type":{"const":"respondConfirmation"}, "confirmationId":{"type":"string", "minLength":1, "maxLength":256}, "decision":{"type":"string", "enum":["Accept", "Reject", "Abort"]}}, "required":["type", "confirmationId", "decision"], "additionalProperties":false}),
+        json!({"type":"object", "properties":{"type":{"const":"setWindow"}, "enabled":{"type":"boolean"}}, "required":["type", "enabled"], "additionalProperties":false}),
+        json!({"type":"object", "properties":{"type":{"const":"notification"}, "id":{"type":"integer", "minimum":1, "maximum":i32::MAX}, "action":{"type":"string", "minLength":1, "maxLength":256, "description":"Action name from the notification in studio_plugin_state; omit to dismiss it."}}, "required":["type", "id"], "additionalProperties":false}),
+        json!({"type":"object", "properties":{"type":{"const":"focusChange"}, "id":{"type":"string", "minLength":1, "maxLength":128, "description":"Change ID from studio_plugin_changes to select and focus in Studio, including unsynced pending removals."}}, "required":["type", "id"], "additionalProperties":false}),
+    ]);
+    json!({"oneOf": variants})
 }
 
 enum ToolCall {
@@ -448,8 +501,7 @@ enum ToolCall {
     StudioList,
     StudioCommand {
         client_id: String,
-        command: &'static str,
-        ids: Option<Vec<String>>,
+        action: StudioAction,
     },
 }
 
@@ -457,8 +509,13 @@ fn validate_tool(name: &str, args: &Map<String, Value>) -> Result<ToolCall, &'st
     let allowed: &[&str] = match name {
         "rojo_project" | "studio_list" => &[],
         "rojo_read_instances" => &["ids"],
-        "studio_status" | "studio_get_selection" => &["clientId"],
+        "studio_status" | "studio_get_selection" | "studio_plugin_state" => &["clientId"],
         "studio_set_selection" => &["clientId", "ids"],
+        "studio_plugin_changes" => &["clientId", "offset", "limit"],
+        "studio_plugin_action" => &["clientId", "action"],
+        "studio_plugin_diff" => &[
+            "clientId", "id", "property", "side", "offset", "limit", "revision",
+        ],
         _ => return Err("Unknown tool"),
     };
     if args.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -475,18 +532,85 @@ fn validate_tool(name: &str, args: &Map<String, Value>) -> Result<ToolCall, &'st
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .ok_or("clientId must be a Studio client UUID from studio_list")?
                 .to_string();
-            let (command, ids) = match name {
-                "studio_status" => ("getStatus", None),
-                "studio_get_selection" => ("getSelection", None),
-                "studio_set_selection" => ("setSelection", Some(parse_ids(args, true)?)),
+            let action = match name {
+                "studio_status" => StudioAction::GetStatus {},
+                "studio_get_selection" => StudioAction::GetSelection {},
+                "studio_set_selection" => StudioAction::SetSelection {
+                    ids: parse_ids(args, true)?
+                        .iter()
+                        .map(|id| Ref::from_str(id).unwrap())
+                        .collect(),
+                },
+                "studio_plugin_state" => StudioAction::GetPluginState {},
+                "studio_plugin_changes" => {
+                    let offset = parse_page_argument(args, "offset", 0)?;
+                    let limit = parse_page_argument(args, "limit", 50)?;
+                    if limit == 0 || limit > MAX_PLUGIN_CHANGES {
+                        return Err("limit must be between 1 and 100");
+                    }
+                    StudioAction::GetPluginChanges { offset, limit }
+                }
+                "studio_plugin_action" => {
+                    let action: PluginAction = serde_json::from_value(
+                        args.get("action").cloned().ok_or("action is required")?,
+                    )
+                    .map_err(|_| "Invalid plugin action; use the action schema from tools/list")?;
+                    action.validate()?;
+                    StudioAction::PluginAction { action }
+                }
+                "studio_plugin_diff" => {
+                    let id = args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or("id is required")?
+                        .to_owned();
+                    let property = args
+                        .get("property")
+                        .and_then(Value::as_str)
+                        .ok_or("property is required")?
+                        .to_owned();
+                    let side: DiffSide = serde_json::from_value(
+                        args.get("side").cloned().ok_or("side is required")?,
+                    )
+                    .map_err(|_| "side must be old or new")?;
+                    let offset = parse_page_argument(args, "offset", 0)?;
+                    let limit = parse_page_argument(args, "limit", 8192)?;
+                    let revision = args
+                        .get("revision")
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .ok_or("revision must be a nonnegative integer")
+                        })
+                        .transpose()?;
+                    validate_plugin_diff(&id, &property, offset, limit, revision)?;
+                    StudioAction::GetPluginDiff {
+                        id,
+                        property,
+                        side,
+                        offset,
+                        limit,
+                        revision,
+                    }
+                }
                 _ => unreachable!(),
             };
-            Ok(ToolCall::StudioCommand {
-                client_id,
-                command,
-                ids,
-            })
+            Ok(ToolCall::StudioCommand { client_id, action })
         }
+    }
+}
+
+fn parse_page_argument(
+    args: &Map<String, Value>,
+    name: &str,
+    default: usize,
+) -> Result<usize, &'static str> {
+    match args.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| value.try_into().ok())
+            .ok_or("offset and limit must be nonnegative integers"),
     }
 }
 
@@ -543,22 +667,16 @@ impl Backend {
                 let body = self.request("/api/studio/clients", None, true)?;
                 serde_json::from_slice(&body).context("Rojo returned invalid Studio client JSON")
             }
-            ToolCall::StudioCommand {
-                client_id,
-                command,
-                ids,
-            } => {
+            ToolCall::StudioCommand { client_id, action } => {
                 let project = self.project()?;
                 let session_id = project
                     .get("sessionId")
                     .context("Rojo did not return a session ID")?;
                 let _: SessionId = serde_json::from_value(session_id.clone())
                     .context("Rojo returned an invalid session ID")?;
-                let mut request =
-                    json!({"sessionId": session_id, "clientId": client_id, "command": command});
-                if let Some(ids) = ids {
-                    request["ids"] = json!(ids);
-                }
+                let mut request = serde_json::to_value(action)?;
+                request["sessionId"] = session_id.clone();
+                request["clientId"] = json!(client_id);
                 // Cancellation cannot undo a command already sent to Studio. The
                 // transport suppresses its result, but stop before dispatch when
                 // cancellation arrived while obtaining the current serve session.
@@ -714,7 +832,7 @@ mod tests {
             .is_none());
         let result = server.handle(list).unwrap();
         assert_eq!(result["id"], "list");
-        assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 10);
         assert_eq!(initialize(&mut server)["error"]["code"], -32600);
     }
 
@@ -821,7 +939,7 @@ mod tests {
         assert!(validate_tool("rojo_read_instances", ids.as_object().unwrap()).is_err());
         let clear = json!({"clientId": Uuid::new_v4().to_string(), "ids": []});
         assert!(
-            matches!(validate_tool("studio_set_selection", clear.as_object().unwrap()).unwrap(), ToolCall::StudioCommand { ids: Some(ids), .. } if ids.is_empty())
+            matches!(validate_tool("studio_set_selection", clear.as_object().unwrap()).unwrap(), ToolCall::StudioCommand { action: StudioAction::SetSelection { ids }, .. } if ids.is_empty())
         );
     }
 
@@ -853,6 +971,149 @@ mod tests {
         ] {
             assert!(local_origin(origin).is_err(), "{origin}");
         }
+    }
+
+    #[test]
+    fn plugin_tools_validate_actions_and_pagination_before_contacting_server() {
+        let client_id = Uuid::new_v4().to_string();
+        for action in [
+            json!({"type":"connect", "host":"https://localhost", "port":34872}),
+            json!({"type":"connect"}),
+            json!({"type":"disconnect"}),
+            json!({"type":"reconnect"}),
+            json!({"type":"setSettings", "settings":{"playSounds":false}}),
+            json!({"type":"respondConfirmation", "confirmationId":"current", "decision":"Abort"}),
+            json!({"type":"setWindow", "enabled":true}),
+            json!({"type":"openSettings"}),
+            json!({"type":"closeSettings"}),
+            json!({"type":"dismissError"}),
+            json!({"type":"forgetProject"}),
+            json!({"type":"notification", "id":1, "action":"reconnect"}),
+            json!({"type":"notification", "id":1}),
+            json!({"type":"checkUpdates"}),
+            json!({"type":"focusChange", "id":Ref::new().to_string()}),
+            json!({"type":"focusChange", "id":Uuid::new_v4().to_string()}),
+        ] {
+            let arguments = json!({"clientId":client_id, "action":action});
+            assert!(
+                validate_tool("studio_plugin_action", arguments.as_object().unwrap()).is_ok(),
+                "{arguments}"
+            );
+        }
+        for action in [
+            json!({"type":"execute", "source":"anything"}),
+            json!({"type":"disconnect", "extra":true}),
+            json!({"type":"connect", "host":"http://user@localhost"}),
+            json!({"type":"connect", "port":0}),
+            json!({"type":"connect", "port":65536}),
+            json!({"type":"connect", "port":"34872"}),
+            json!({"type":"setSettings", "settings":{}}),
+            json!({"type":"setSettings", "settings":{"nested":[]}}),
+            json!({"type":"respondConfirmation", "confirmationId":"old", "decision":"ignore"}),
+            json!({"type":"respondConfirmation", "decision":"Accept"}),
+            json!({"type":"setWindow", "enabled":1}),
+            json!({"type":"notification", "id":-1}),
+            json!({"type":"notification", "id":0}),
+            json!({"type":"notification", "id":2147483648u64}),
+            json!({"type":"notification", "id":1, "action":null}),
+            json!({"type":"connect", "host":null}),
+            json!({"type":"connect", "port":null}),
+            json!({"type":"focusChange", "id":""}),
+            json!({"type":"focusChange", "id":"x".repeat(129)}),
+        ] {
+            let arguments = json!({"clientId":client_id, "action":action});
+            assert!(
+                validate_tool("studio_plugin_action", arguments.as_object().unwrap()).is_err(),
+                "{arguments}"
+            );
+        }
+        let arguments = json!({"clientId":client_id});
+        assert!(matches!(
+            validate_tool("studio_plugin_changes", arguments.as_object().unwrap()).unwrap(),
+            ToolCall::StudioCommand {
+                action: StudioAction::GetPluginChanges {
+                    offset: 0,
+                    limit: 50
+                },
+                ..
+            }
+        ));
+        for pagination in [
+            json!({"limit":0}),
+            json!({"limit":101}),
+            json!({"offset":-1}),
+            json!({"offset":1.5}),
+            json!({"limit":"50"}),
+            json!({"offset":null}),
+        ] {
+            let mut arguments = pagination;
+            arguments["clientId"] = json!(client_id);
+            assert!(
+                validate_tool("studio_plugin_changes", arguments.as_object().unwrap()).is_err(),
+                "{arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_action_schema_exposes_typed_closed_variants() {
+        let schema = plugin_action_schema();
+        let variants = schema["oneOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 13);
+        for variant in variants {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], false);
+            assert!(variant["properties"]["type"]["const"].is_string());
+            assert!(variant["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("type")));
+        }
+        assert!(variants
+            .iter()
+            .any(|variant| variant["properties"]["confirmationId"]["type"] == "string"));
+    }
+
+    #[test]
+    fn plugin_diff_tool_requires_a_property_and_bounds_byte_ranges() {
+        let arguments = json!({"clientId":Uuid::new_v4().to_string(), "id":"change-id", "property":"Source", "side":"old"});
+        assert!(matches!(
+            validate_tool("studio_plugin_diff", arguments.as_object().unwrap()).unwrap(),
+            ToolCall::StudioCommand {
+                action: StudioAction::GetPluginDiff {
+                    side: DiffSide::Old,
+                    offset: 0,
+                    limit: 8192,
+                    ..
+                },
+                ..
+            }
+        ));
+        for (key, value) in [
+            ("id", json!("")),
+            ("property", json!("")),
+            ("side", json!("both")),
+            ("offset", json!(-1)),
+            ("offset", json!(1)),
+            ("offset", json!(MAX_PLUGIN_VALUE_BYTES + 1)),
+            ("revision", json!(MAX_PLUGIN_REVISION + 1)),
+            ("revision", json!(null)),
+            ("revision", json!(1.5)),
+            ("limit", json!(0)),
+            ("limit", json!(16385)),
+            ("extra", json!(true)),
+        ] {
+            let mut invalid = arguments.clone();
+            invalid[key] = value;
+            assert!(
+                validate_tool("studio_plugin_diff", invalid.as_object().unwrap()).is_err(),
+                "{invalid}"
+            );
+        }
+        let mut next_chunk = arguments;
+        next_chunk["offset"] = json!(8192);
+        next_chunk["revision"] = json!(3);
+        assert!(validate_tool("studio_plugin_diff", next_chunk.as_object().unwrap()).is_ok());
     }
 
     fn http_server(
@@ -914,8 +1175,7 @@ mod tests {
                 .call(
                     ToolCall::StudioCommand {
                         client_id: client_id.clone(),
-                        command: "setSelection",
-                        ids: Some(vec![])
+                        action: StudioAction::SetSelection { ids: vec![] }
                     },
                     None
                 )
@@ -944,8 +1204,7 @@ mod tests {
             .call(
                 ToolCall::StudioCommand {
                     client_id: Uuid::new_v4().to_string(),
-                    command: "getStatus",
-                    ids: None,
+                    action: StudioAction::GetStatus {},
                 },
                 None,
             )

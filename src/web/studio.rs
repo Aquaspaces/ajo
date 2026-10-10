@@ -1,9 +1,10 @@
-//! Local HTTP controls and the JSON extension to the existing sync socket.
+//! Local HTTP controls and an independent control socket for the Studio plugin.
 
 use std::{net::SocketAddr, sync::Arc};
 
+use futures::{SinkExt, StreamExt};
 use hyper::{body::HttpBody, Body, Method, Request, Response, StatusCode};
-use rbx_dom_weak::types::Ref;
+use hyper_tungstenite::{is_upgrade_request, tungstenite::Message, upgrade, HyperWebsocket};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -20,18 +21,18 @@ pub const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct CommandRequest {
     session_id: SessionId,
     client_id: String,
-    command: String,
-    ids: Option<Vec<Ref>>,
+    #[serde(flatten)]
+    action: StudioAction,
 }
 
 pub async fn call(
     session: Arc<ServeSession>,
     remote_addr: SocketAddr,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Response<Body> {
     if !canonical(remote_addr.ip()).is_loopback() {
         return util::json(
@@ -44,6 +45,28 @@ pub async fn call(
         return error(StudioError::Disabled);
     }
     match (request.method(), request.uri().path()) {
+        (&Method::GET, "/api/studio/socket") => {
+            if !is_upgrade_request(&request) {
+                return error(StudioError::Invalid(
+                    "/api/studio/socket requires a WebSocket upgrade".into(),
+                ));
+            }
+            let config = hyper_tungstenite::tungstenite::protocol::WebSocketConfig {
+                max_message_size: Some(MAX_PACKET_BYTES),
+                max_frame_size: Some(MAX_PACKET_BYTES),
+                ..Default::default()
+            };
+            let (response, socket) = match upgrade(&mut request, Some(config)) {
+                Ok(upgraded) => upgraded,
+                Err(err) => return error(StudioError::Invalid(err.to_string())),
+            };
+            tokio::spawn(async move {
+                if let Err(err) = handle_control_socket(session, socket).await {
+                    log::debug!("Studio control socket closed: {err}");
+                }
+            });
+            response
+        }
         (&Method::GET, "/api/studio/clients") => match bridge.clients() {
             Ok(clients) => util::json(
                 json!({"sessionId":session.session_id(),"clients":clients}),
@@ -89,13 +112,7 @@ pub async fn call(
                     StatusCode::CONFLICT,
                 );
             }
-            let action = match (request.command.as_str(), request.ids) {
-                ("getStatus", None) => StudioAction::GetStatus,
-                ("getSelection", None) => StudioAction::GetSelection,
-                ("setSelection", Some(ids)) => StudioAction::SetSelection { ids },
-                _ => return error(StudioError::Invalid("expected getStatus/getSelection without ids, or setSelection with an ids array".into())),
-            };
-            match bridge.request(&request.client_id, action).await {
+            match bridge.request(&request.client_id, request.action).await {
                 Ok(result) => util::json(
                     json!({"sessionId":session.session_id(),"result":result}),
                     StatusCode::OK,
@@ -108,6 +125,50 @@ pub async fn call(
             StatusCode::NOT_FOUND,
         ),
     }
+}
+
+async fn handle_control_socket(
+    session: Arc<ServeSession>,
+    socket: HyperWebsocket,
+) -> anyhow::Result<()> {
+    let mut socket = socket.await?;
+    let mut connection: Option<StudioConnection> = None;
+    let mut commands: Option<mpsc::Receiver<StudioCommand>> = None;
+    loop {
+        tokio::select! {
+            command = async {
+                match commands.as_mut() {
+                    Some(commands) => commands.recv().await,
+                    None => futures::future::pending().await,
+                }
+            } => {
+                let Some(command) = command else { break; };
+                if connection.as_ref().is_some_and(|connection| connection.is_pending(&command.request_id)) {
+                    let packet = json!({"sessionId":session.session_id(), "packetType":"studioCommand", "body":command});
+                    socket.send(Message::Text(serde_json::to_string(&packet)?)).await?;
+                }
+            }
+            message = socket.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Err(err) = handle_packet(&session, &text, &mut connection, &mut commands) {
+                            let _ = socket.send(Message::Close(None)).await;
+                            return Err(err);
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => socket.flush().await?,
+                    Some(Ok(Message::Pong(_))) => {},
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        anyhow::bail!("Studio control socket requires JSON text packets");
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn error(err: StudioError) -> Response<Body> {
@@ -148,7 +209,9 @@ pub fn handle_packet(
             let info: StudioInfo = serde_json::from_value(packet.body)?;
             // Opened may race with the client's ConnectionState check. A second
             // hello must not replace the identity owning outstanding requests.
-            if connection.is_none() {
+            if let Some(connection) = connection {
+                connection.update_info(info)?;
+            } else {
                 let (registered, receiver) = session.studio_bridge().register(info)?;
                 *connection = Some(registered);
                 *commands = Some(receiver);
@@ -182,4 +245,43 @@ pub fn handle_packet(
         _ => anyhow::bail!("Unknown Studio packet type"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_requests_reject_unrelated_fields_and_invalid_actions() {
+        for invalid in [
+            json!({"command":"getPluginState", "ids":[]}),
+            json!({"command":"getStatus", "action":{"type":"disconnect"}}),
+            json!({"command":"getPluginChanges", "offset":0, "limit":2, "extra":true}),
+            json!({"command":"pluginAction", "action":{"type":"disconnect", "host":"localhost"}}),
+            json!({"command":"pluginAction", "action":{"type":"setWindow", "enabled":"true"}}),
+            json!({"command":"pluginAction", "action":{"type":"respondConfirmation", "confirmationId":"one", "decision":"yes"}}),
+        ] {
+            let mut request = invalid;
+            request["sessionId"] = json!(SessionId::new());
+            request["clientId"] = json!("client");
+            assert!(
+                serde_json::from_value::<CommandRequest>(request.clone()).is_err(),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_preserve_plugin_parameters_and_confirmation_identity() {
+        let request: CommandRequest = serde_json::from_value(json!({
+            "sessionId":SessionId::new(), "clientId":"client", "command":"pluginAction",
+            "action":{"type":"respondConfirmation", "confirmationId":"confirmation-7", "decision":"Reject"}
+        })).unwrap();
+        assert_eq!(
+            serde_json::to_value(request.action).unwrap(),
+            json!({
+                "command":"pluginAction", "action":{"type":"respondConfirmation", "confirmationId":"confirmation-7", "decision":"Reject"}
+            })
+        );
+    }
 }

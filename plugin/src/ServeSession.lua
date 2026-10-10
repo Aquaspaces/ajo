@@ -203,55 +203,66 @@ function ServeSession:start()
 	self.__apiContext
 		:connect()
 		:andThen(function(serverInfo)
+			if self.__status == Status.Disconnected then
+				return
+			end
 			self:setLoadingText("Loading initial data from server...")
 			return self:__initialSync(serverInfo):andThen(function()
+				if self.__status == Status.Disconnected then
+					return
+				end
 				self:setLoadingText("Starting sync loop...")
 				self:__setStatus(Status.Connected, serverInfo.projectName)
 				self:__applyGameAndPlaceId(serverInfo)
 
-				return self.__apiContext:connectWebSocket({
-					["messages"] = function(messagesPacket)
-						if self.__status == Status.Disconnected then
-							return
-						end
-
-						Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
-
-						self.__studioControls:beginSync()
-						local success, err = pcall(function()
-							for _, message in messagesPacket.messages do
-								self:__applyPatch(message)
+				return self.__apiContext:connectWebSocket(
+					{
+						["messages"] = function(messagesPacket)
+							if self.__status == Status.Disconnected then
+								return
 							end
-							self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
-						end)
-						self.__studioControls:endSync()
-						if not success then
-							error(err, 0)
-						end
-					end,
-					["studioCommand"] = function(commandPacket)
-						if self.__status ~= Status.Connected then
-							return
-						end
 
-						local success, result = pcall(function()
-							return self.__studioControls:execute(commandPacket.command, commandPacket.ids)
-						end)
-						local response = { requestId = commandPacket.requestId }
-						if success then
-							response.result = result
-						else
-							response.error = tostring(result)
+							Log.debug("Received {} messages from Rojo server", #messagesPacket.messages)
+
+							self.__studioControls:beginSync()
+							local success, err = pcall(function()
+								for _, message in messagesPacket.messages do
+									self:__applyPatch(message)
+								end
+								self.__apiContext:setMessageCursor(messagesPacket.messageCursor)
+							end)
+							self.__studioControls:endSync()
+							if not success then
+								error(err, 0)
+							end
+						end,
+						["studioCommand"] = function(commandPacket)
+							if self.__status ~= Status.Connected then
+								return
+							end
+
+							local success, result = pcall(function()
+								return self.__studioControls:execute(commandPacket.command, commandPacket.ids)
+							end)
+							local response = { requestId = commandPacket.requestId }
+							if success then
+								response.result = result
+							else
+								response.error = tostring(result)
+							end
+							self.__apiContext:sendStudioResult(response)
+						end,
+					},
+					if self.__apiContext.__studioPluginControlsEnabled
+						then nil
+						else function()
+							return {
+								placeId = game.PlaceId,
+								gameId = game.GameId,
+								placeName = game.Name,
+							}
 						end
-						self.__apiContext:sendStudioResult(response)
-					end,
-				}, function()
-					return {
-						placeId = game.PlaceId,
-						gameId = game.GameId,
-						placeName = game.Name,
-					}
-				end)
+				)
 			end)
 		end)
 		:catch(function(err)
@@ -441,6 +452,15 @@ function ServeSession:__replaceInstances(idList)
 end
 
 function ServeSession:__applyPatch(patch)
+	self.__studioControls:beginSync()
+	local success, err = pcall(self.__applyPatchInternal, self, patch)
+	self.__studioControls:endSync()
+	if not success then
+		error(err, 0)
+	end
+end
+
+function ServeSession:__applyPatchInternal(patch)
 	local patchTimestamp = DateTime.now():FormatLocalTime("LTS", "en-us")
 	local historyRecording = ChangeHistoryService:TryBeginRecording("Rojo: Patch " .. patchTimestamp)
 	if not historyRecording then
@@ -522,6 +542,9 @@ end
 
 function ServeSession:__initialSync(serverInfo)
 	return self.__apiContext:read({ serverInfo.rootInstanceId }):andThen(function(readResponseBody)
+		if self.__status == Status.Disconnected then
+			return
+		end
 		-- Tell the API Context that we're up-to-date with the version of
 		-- the tree defined in this response.
 		self.__apiContext:setMessageCursor(readResponseBody.messageCursor)
@@ -538,6 +561,9 @@ function ServeSession:__initialSync(serverInfo)
 		self:setLoadingText("Finding differences between server and Studio...")
 		local success, catchUpPatch =
 			self.__reconciler:diff(readResponseBody.instances, serverInfo.rootInstanceId, game)
+		if self.__status == Status.Disconnected then
+			return
+		end
 
 		if not success then
 			Log.error("Could not compute a diff to catch up to the Rojo server: {:#?}", catchUpPatch)
@@ -561,6 +587,9 @@ function ServeSession:__initialSync(serverInfo)
 		local userDecision = "Accept"
 		if self.__userConfirmCallback ~= nil then
 			userDecision = self.__userConfirmCallback(self.__instanceMap, catchUpPatch, serverInfo)
+		end
+		if self.__status == Status.Disconnected then
+			return
 		end
 
 		if userDecision == "Abort" then
@@ -605,6 +634,9 @@ function ServeSession:__initialSync(serverInfo)
 end
 
 function ServeSession:__stopInternal(err)
+	if self.__status == Status.Disconnected then
+		return
+	end
 	self:__setStatus(Status.Disconnected, err)
 	self.__apiContext:disconnect()
 	self.__instanceMap:stop()

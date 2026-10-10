@@ -20,7 +20,7 @@ local defaultSettings = {
 	checkForUpdates = true,
 	checkForPrereleases = false,
 	autoConnectPlaytestServer = false,
-	confirmationBehavior = "Initial" :: "Never" | "Initial" | "Large Changes" | "Unlisted PlaceId",
+	confirmationBehavior = "Initial" :: "Never" | "Initial" | "Always" | "Large Changes" | "Unlisted PlaceId",
 	largeChangesConfirmationThreshold = 5,
 	playSounds = true,
 	typecheckingEnabled = false,
@@ -30,6 +30,64 @@ local defaultSettings = {
 }
 
 local Settings = {}
+
+local settingOptions = {
+	syncReminderMode = { "None", "Notify", "Fullscreen" },
+	confirmationBehavior = { "Initial", "Always", "Large Changes", "Unlisted PlaceId", "Never" },
+	logLevel = { "Error", "Warning", "Info", "Debug", "Trace" },
+}
+
+function Settings:getPublicSchema()
+	local schema = {}
+	for name, value in defaultSettings do
+		if name ~= "priorEndpoints" then
+			schema[name] = {
+				type = type(value),
+				default = value,
+				options = if settingOptions[name] then table.clone(settingOptions[name]) else nil,
+				minimum = if name == "largeChangesConfirmationThreshold" then 1 else nil,
+				maximum = if name == "largeChangesConfirmationThreshold" then 999 else nil,
+				lockedWhileSyncing = name == "twoWaySync",
+			}
+		end
+	end
+	return schema
+end
+
+function Settings:getPublicValues()
+	local values = {}
+	for name in self:getPublicSchema() do
+		values[name] = self:get(name)
+	end
+	return values
+end
+
+function Settings:setPublicValues(values, syncActive)
+	assert(type(values) == "table", "settings must be an object")
+	-- Validate the whole request before persisting any field.
+	for name, value in values do
+		assert(
+			type(name) == "string" and name ~= "priorEndpoints" and defaultSettings[name] ~= nil,
+			"Unknown plugin setting: " .. tostring(name)
+		)
+		assert(type(value) == type(defaultSettings[name]), "Invalid type for setting " .. name)
+		if settingOptions[name] then
+			assert(table.find(settingOptions[name], value) ~= nil, "Invalid value for setting " .. name)
+		elseif name == "largeChangesConfirmationThreshold" then
+			assert(
+				value >= 1 and value <= 999 and value % 1 == 0,
+				"Confirmation threshold must be an integer from 1 to 999"
+			)
+		end
+		assert(
+			not (name == "twoWaySync" and syncActive and value ~= self:get(name)),
+			"Cannot change twoWaySync while syncing. Disconnect first."
+		)
+	end
+	for name, value in values do
+		self:set(name, value)
+	end
+end
 
 Settings._values = table.clone(defaultSettings)
 Settings._updateListeners = {}
